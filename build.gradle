@@ -1,0 +1,457 @@
+buildscript {
+    repositories {
+        maven {
+            url = project.hasProperty('artifactory_contextUrl') ? "${artifactory_contextUrl}/jcenter" : 'https://jcenter.bintray.com'
+        }
+    }
+}
+
+import de.undercouch.gradle.tasks.download.Download
+import groovy.io.FileType
+import groovy.json.JsonSlurper
+import java.nio.file.Files
+import java.net.URL
+
+plugins {
+    //Check the latest version on bintray: https://bintray.com/jfrog/jfrog-jars/build-info-extractor-gradle/view
+    id "com.jfrog.artifactory" version "3.1.1"
+    id "de.undercouch.download" version "1.2"
+}
+
+repositories {
+    maven {
+        url = project.hasProperty('artifactory_contextUrl') ? "${artifactory_contextUrl}/jcenter" : 'https://jcenter.bintray.com'
+    }
+}
+
+apply plugin: 'java'
+apply plugin: 'groovy'
+apply plugin: 'idea'
+apply plugin: 'eclipse'
+
+test {
+    outputs.upToDateWhen { false }
+    testLogging {
+        showStandardStreams = true
+    }
+}
+
+version = "$currentVersion"
+group = 'org.jfrog.art-plugin-dev'
+
+def etcDir = new File(projectDir, 'etc')
+def scriptsDir = new File(projectDir, 'src/scripts')
+def installSh = new File(scriptsDir, 'install.sh')
+def control = new File(scriptsDir, 'control-art.sh')
+def localDir = new File('local-store')
+def artDir = new File('artifactory')
+def artProZip = new File(localDir, 'artifactory-pro.zip')
+
+def getArtVersion() {
+    if (!project.hasProperty('artifactoryVersion')) {
+        return null
+    } else if (artifactoryVersion == "_latest") {
+        try {
+            def url = new URL("https://api.bintray.com/packages/jfrog/artifactory-pro/jfrog-artifactory-pro-zip")
+            def json = new JsonSlurper().parse(url)
+            artifactoryVersion = json.latest_version
+            return json.latest_version
+        } catch (Exception ex) {
+            throw new IOException("Could not retrieve the latest Artifactory version number from bintray.", ex)
+        }
+    } else return artifactoryVersion
+}
+
+dependencies {
+    testCompile(group: 'org.spockframework', name: 'spock-core', version: '0.7-groovy-2.0') {
+        exclude module : 'groovy-all'
+    }
+    testCompile(group: 'com.icegreen', name: 'greenmail', version: '1.4.1')
+    compile(group: 'org.codehaus.groovy', name: 'groovy-all', version: '2.4.5')
+    compile(group: 'org.artifactory.oss', name: 'jfrog-artifactory-oss', version: '4.16.0')
+    compile(group: 'org.jfrog.artifactory.client', name: 'artifactory-java-client-services', version: '2.3.2')
+}
+
+task downloadArtPro << {
+    def downloadurl
+    def version = getArtVersion()
+    if (!project.hasProperty('artifactoryDownloadUrl')) {
+        if (version.startsWith("2.") || version.startsWith("3.")) {
+            downloadurl = "https://dl.bintray.com/jfrog/artifactory-pro/org/artifactory/powerpack/artifactory-powerpack-standalone/[VERSION]/artifactory-powerpack-standalone-[VERSION].zip"
+        } else {
+            downloadurl = "https://dl.bintray.com/jfrog/artifactory-pro/org/artifactory/pro/jfrog-artifactory-pro/[VERSION]/jfrog-artifactory-pro-[VERSION].zip"
+        }
+    } else downloadurl = artifactoryDownloadUrl
+    def updatedUrl = downloadurl.replaceAll('\\[VERSION]', version)
+    println "Downloading $updatedUrl into ${artProZip.getPath()}"
+    download {
+        src updatedUrl
+        dest artProZip
+        onlyIfNewer true
+        quiet true
+    }
+}
+
+idea {
+    project {
+        ipr {
+            withXml { provider ->
+                provider.node.component.find({ it.@name == 'VcsDirectoryMappings' }).mapping.@vcs = 'Git'
+            }
+        }
+    }
+    module {
+        sourceDirs += new File(etcDir, 'plugins')
+    }
+}
+
+eclipse {
+    classpath {
+        file {
+            withXml {
+                it.asNode().appendNode('classpathentry', [kind: "src", path: "etc/plugins"])
+            }
+        }
+    }
+}
+
+task prepareArtPro() {
+    dependsOn downloadArtPro
+    doLast {
+        def cmd = "bash ${getPath(installSh)} ${getPath(etcDir)} ${getPath(localDir)} ${getPath(artDir)}"
+        execute(cmd)
+    }
+}
+
+task startArtPro() {
+    doLast {
+        def cmd = "bash ${getPath(control)} ${getPath(artDir)} start"
+        execute(cmd)
+    }
+}
+
+task stopArtPro() {
+    doLast {
+        def cmd = "bash ${getPath(control)} ${getPath(artDir)} stop"
+        execute(cmd)
+    }
+}
+
+task restartArtPro() {
+    doLast {
+        execute("bash ${getPath(control)} ${getPath(artDir)} stop")
+        execute("bash ${getPath(control)} ${getPath(artDir)} start")
+    }
+}
+
+task cleanArtPro() {
+    dependsOn stopArtPro
+    doLast {
+        def cmd = "rm -rf ${getPath(artDir)}"
+        execute(cmd)
+    }
+}
+
+task updateArtPro() {
+    // download the newest version first, if there is one
+    dependsOn downloadArtPro
+    doLast {
+        // can't extract the new version without the zip
+        if (!artProZip.exists()) {
+            throw new RuntimeException("The Artifactory Pro zip file $artProZip.path does not exist")
+        }
+        println "Updating Artifactory ..."
+        if (!artDir.directory) {
+            if (artDir.exists()) artDir.delete()
+            artDir.mkdirs()
+        }
+        // read the new version number from the zip early, in case it's already installed
+        def newArtVersion = null
+        def pathStream = "unzip -l $artProZip.path".execute().inputStream
+        for (def line : pathStream.readLines()) {
+            def match = line =~ 'artifactory-(?:pro|powerpack)-[^/]*'
+            if (match.count > 0) {
+                newArtVersion = match[0]
+                break
+            }
+        }
+        pathStream.close()
+        if (newArtVersion != null && new File(artDir, newArtVersion).directory) {
+            println "Artifactory is already up to date: nothing to be done"
+            return
+        }
+        def tmpfile = new File(artDir, "tmp-${new Random().nextInt()}")
+        try {
+            // extract the new version from the zip, and set it up
+            tmpfile.mkdir()
+            execute("bash ${getPath(installSh)} ${getPath(etcDir)} ${getPath(localDir)} ${getPath(tmpfile)}")
+            def newArtifactories = tmpfile.listFiles()
+            if (newArtifactories.length != 1) {
+                throw new RuntimeException("Artifactory was not extracted correctly")
+            }
+            def newArtifactorySrc = newArtifactories[0]
+            def newArtifactoryDst = new File(artDir, newArtifactorySrc.name)
+            // there should only be one Artifactory already installed, but if there is more than one,
+            // find the most recently modified one
+            def oldArtifactory = null
+            for (File file : artDir.listFiles()) {
+                if (file.directory && (file.name.startsWith('artifactory-pro-')
+                        || file.name.startsWith('artifactory-powerpack-'))) {
+                    if (oldArtifactory == null || file.lastModified() > oldArtifactory.lastModified()) {
+                        oldArtifactory = file
+                    }
+                }
+            }
+            // if there aren't any old installs, move the new copy to the correct location
+            if (oldArtifactory == null) {
+                if (newArtifactoryDst.exists()) GFileUtils.forceDelete(newArtifactoryDst)
+                GFileUtils.moveDirectory(newArtifactorySrc, newArtifactoryDst)
+                GFileUtils.forceDelete(tmpfile)
+                println "Artifactory updated successfully"
+                return
+            }
+            // upgrade the old install with the contents of the new package
+            // (follows the instructions on the wiki)
+            def serversrc = new File(oldArtifactory, 'tomcat/conf/server.xml')
+            def serverdst = new File(newArtifactorySrc, 'tomcat/conf/server.xml')
+            if (serversrc.exists()) {
+                if (serverdst.exists()) GFileUtils.forceDelete(serverdst)
+                GFileUtils.copyFile(serversrc, serverdst)
+            }
+            def tomcatlibsrc = new File(oldArtifactory, 'tomcat/lib')
+            def tomcatlibdst = new File(newArtifactorySrc, 'tomcat/lib')
+            if (tomcatlibsrc.directory) {
+                if (tomcatlibdst.exists() && !tomcatlibdst.directory) GFileUtils.forceDelete(tomcatlibdst)
+                for (File srcfile : tomcatlibsrc.listFiles()) {
+                    def dstfile = new File(tomcatlibdst, srcfile.name)
+                    if (!dstfile.exists()) GFileUtils.copyFile(srcfile, dstfile)
+                }
+            }
+            // set up all the files that need to be moved
+            def warsrc = new File(newArtifactorySrc, 'webapps/artifactory.war')
+            def wardst = new File(oldArtifactory, 'webapps/artifactory.war')
+            def tomcatsrc = new File(newArtifactorySrc, 'tomcat')
+            def tomcatdst = new File(oldArtifactory, 'tomcat')
+            def binsrc = new File(newArtifactorySrc, 'bin')
+            def bindst = new File(oldArtifactory, 'bin')
+            def etcsrc = new File(newArtifactorySrc, 'etc')
+            def etcdst = new File(oldArtifactory, 'etc')
+            // move the files
+            if (warsrc.exists() && !warsrc.directory) {
+                if (wardst.exists()) GFileUtils.forceDelete(wardst)
+                GFileUtils.moveFile(warsrc, wardst)
+            }
+            if (tomcatsrc.directory) {
+                if (tomcatdst.exists()) GFileUtils.forceDelete(tomcatdst)
+                GFileUtils.moveDirectory(tomcatsrc, tomcatdst)
+            }
+            if (binsrc.directory) {
+                if (bindst.exists()) GFileUtils.forceDelete(bindst)
+                GFileUtils.moveDirectory(binsrc, bindst)
+            }
+            if (etcsrc.directory) {
+                if (etcdst.exists()) GFileUtils.forceDelete(etcdst)
+                GFileUtils.moveDirectory(etcsrc, etcdst)
+            }
+            // move the upgraded copy to the correct location
+            if (newArtifactoryDst.exists()) GFileUtils.forceDelete(newArtifactoryDst)
+            GFileUtils.moveDirectory(oldArtifactory, newArtifactoryDst)
+            GFileUtils.forceDelete(tmpfile)
+            def artifactoryLn = new File(artDir, "artifactory")
+            def cmd = "ln -fs $newArtifactoryDst $artifactoryLn"
+            execute(cmd)
+            println "Artifactory updated successfully"
+        } finally {
+            if (tmpfile.directory) GFileUtils.forceDelete(tmpfile)
+        }
+    }
+}
+
+// usage: ./gradlew workOnPlugin -DpluginName=governance/preventUnapproved
+// link a plugin and any supplementary files into the dev environment
+// usage: ./gradlew workOnPlugin -DpluginName=all
+// link all plugins and any supplementary files into the dev environment
+task workOnPlugin << {
+    if (!System.properties.pluginName)
+        throw new InvalidUserDataException('No plugin specified')
+    def userPlugins = new File(System.properties.userPluginsDir)
+    if (!userPlugins.isDirectory())
+        throw new InvalidUserDataException('System property userPluginsDir not a directory')
+    if (System.properties.pluginName == 'all') {
+        def dir = new File(userPlugins.absolutePath)
+        dir.eachFileRecurse(FileType.FILES) { file ->
+            if (file.name.endsWith('.groovy') && file.name != 'setup.groovy' && !file.name.endsWith('Test.groovy')) {
+                String prefix = "${file.name.minus('.groovy')}"
+                String tmp = file.absolutePath.minus("/$file.name")
+                String fullPrefix = tmp.minus("$dir.absolutePath/")
+                linkPlugin(fullPrefix,prefix, userPlugins)
+            }
+        }
+    } else {
+        def prefix = new File(System.properties.pluginName).getName()
+        def fullPrefix = System.properties.pluginName
+        linkPlugin(fullPrefix,prefix, userPlugins)
+    }
+}
+
+def linkPlugin(def fullPrefix,def prefix, File userPlugins) {
+    def success = true, linked = false;
+    def etcDir = new File(projectDir, 'etc')
+    def lnPath = new File(etcDir, 'plugins')
+    def lnTestPath = new File(projectDir, 'src/test/groovy')
+    def testprefix = prefix.substring(0, 1).toUpperCase() + prefix.substring(1) + 'Test'
+    for (def pluginFile : new File(userPlugins, fullPrefix).listFiles()) {
+        def fileName = pluginFile.getName()
+        if (fileName.startsWith(prefix + '.')) {
+            if (!"ln -s ${pluginFile.getCanonicalPath()} ${lnPath.getPath()}".execute().waitFor()) {
+                linked = true;
+                logger.quiet "Linked file ${fileName}"
+            } else {
+                success = false;
+                logger.warn "WARN: Failed to link file ${fileName}"
+            }
+        } else if (fileName == testprefix + '.groovy') {
+            if (!"ln -s ${pluginFile.getCanonicalPath()} ${lnTestPath.getPath()}".execute().waitFor()) {
+                linked = true;
+                logger.quiet "Linked test file ${fileName}"
+            } else {
+                success = false;
+                logger.warn "WARN: Failed to link test file ${fileName}"
+            }
+        } else if (fileName == 'test' && pluginFile.isDirectory()) {
+            def lnDest = new File(lnTestPath, testprefix)
+            if (!"ln -s  ${pluginFile.getCanonicalPath()} ${lnDest.getPath()}".execute().waitFor()) {
+                linked = true;
+                logger.quiet "Linked test directory"
+            } else {
+                success = false;
+                logger.warn "WARN: Failed to link test directory"
+            }
+        }
+    }
+    if (success && linked)
+        logger.quiet 'Specified plugin successfully added to environment'
+    else if (!success)
+        logger.warn 'WARN: Warning: Some plugin files could not be added'
+    else
+        throw new InvalidUserDataException('Specified plugin not found')
+    def setupFile = new File(new File(userPlugins, fullPrefix), 'setup.groovy')
+    if (setupFile.isFile()) {
+        def setupBinding = new Binding()
+        setupBinding.installLibraries = { locallibs, globallibs = [] ->
+            def libdir = new File('./etc/plugins/lib')
+            def artdir = new File('./artifactory').listFiles().find {
+                it.name.startsWith('artifactory-pro-') || it.name.startsWith('artifactory-powerpack-')
+            }
+            if (artdir == null) artdir = libdir
+            else artdir = new File(artdir, 'tomcat/webapps/artifactory/WEB-INF/lib')
+            if (!libdir.exists()) libdir.mkdirs()
+            if (!artdir.exists()) artdir.mkdirs()
+            for (def libs : [[locallibs, libdir], [globallibs, artdir]]) {
+                for (def lib : libs[0]) {
+                    def url = new URL("https://jcenter.bintray.com/$lib")
+                    def file = new File(libs[1], lib.substring(lib.lastIndexOf('/') + 1))
+                    if (!file.exists()) file.newOutputStream() << url.openStream()
+                }
+            }
+        }
+        logger.quiet 'Setup file found. Executing ...'
+        new GroovyShell(setupBinding).evaluate(setupFile)
+        logger.quiet '... Done'
+    }
+}
+
+// usage: ./gradlew stopWorkOnPlugin -DpluginName=governance/preventUnapproved
+// remove links to a plugin and any supplementary files from the dev environment, and restart artifactory
+// usage: ./gradlew stopWorkOnPlugin -DpluginName=all
+// remove links to all plugins and any supplementary files from the dev environment, and restart artifactory
+task stopWorkOnPlugin << {
+    if (!System.properties.pluginName) {
+        throw new InvalidUserDataException('No plugin specified')
+    }
+    def success = true, removed = false;
+    def prefix = new File(System.properties.pluginName).getName()
+    def testprefix = prefix.substring(0, 1).toUpperCase() + prefix.substring(1) + 'Test'
+    for (def lnPath : new File(etcDir, 'plugins').listFiles()) {
+        def lnName = lnPath.getName()
+        if ((System.properties.pluginName == 'all' || lnName.startsWith(prefix + '.'))
+                && Files.isSymbolicLink(lnPath.toPath())) {
+            if (lnPath.delete()) {
+                removed = true;
+                println "Removed link ${lnName}"
+            } else {
+                success = false;
+                println "Failed to remove link ${lnName}"
+            }
+        }
+    }
+    for (def lnPath : new File(projectDir, 'src/test/groovy').listFiles()) {
+        def lnName = lnPath.getName()
+        if ((System.properties.pluginName == 'all' || lnName == testprefix + '.groovy' || lnName == testprefix)
+                && Files.isSymbolicLink(lnPath.toPath())) {
+            if (lnPath.delete()) {
+                removed = true;
+                println "Removed test link ${lnName}"
+            } else {
+                success = false;
+                println "Failed to remove test link ${lnName}"
+            }
+        }
+    }
+    if (success && removed) {
+        println 'All specified plugin links successfully removed from environment'
+    } else if (!success) {
+        println 'Warning: Some plugin links could not be removed'
+    } else if (System.properties.pluginName == 'all') {
+        println 'No plugins found in plugins directory; nothing to remove'
+    } else {
+        throw new InvalidUserDataException('Specified plugin not found in plugins directory')
+    }
+    println 'Please restart Artifactory now'
+}
+
+artifactory {
+    contextUrl = project.hasProperty('artifactory_contextUrl') ? "${artifactory_contextUrl}" : 'https://repo.jfrog.org/artifactory'
+    resolve {
+        repository {
+            repoKey = 'user-plugins'
+            maven = true
+        }
+    }
+}
+
+private static String getPath(File file) {
+    def res = "/" + file.getAbsolutePath().replace('\\', '/')
+    res.replace(':', '')
+}
+
+private void execute(GString cmd) {
+    logger.info("Executing $cmd")
+    def proc = cmd.execute()
+    logger.info("launched")
+
+    def builder = new StringBuilder()
+    def builderErr = new StringBuilder()
+    consumeStream(proc.in, builder, null, true)
+    consumeStream(proc.err, builderErr, null, true)
+    def res = proc.waitFor()
+    if (res != 0) {
+        def errors = builderErr.toString()
+        logger.error("Error executing got $res ${errors} ${builder.toString()}")
+        throw new RuntimeException("Could not run project install due to $errors")
+    } else {
+        logger.debug("Success executing got:\n${builder.toString()}")
+    }
+}
+
+public void consumeStream(InputStream stream, StringBuilder outString, File outFile, boolean print) {
+    Thread.start {
+        Reader reader = new BufferedReader(new InputStreamReader(stream))
+        def next
+        while ((next = reader.readLine()) != null) {
+            if (print) println(next)
+            outString?.append(next)?.append("\n")
+            if (outFile != null) outFile << next + "\n"
+        }
+    }
+}
